@@ -88,7 +88,7 @@ python KuuBot.pyw
 | `/formal` | 恢复正常模式 |
 | `/new` | 创建新会话 |
 | `/list` | 列出所有会话 |
-| `/switch <名称>` | 切换会话 |
+| `/switch <编号\|名称>` | 切换会话 |
 | `/rename <新名称>` | 重命名 |
 | `/delete <编号\|名称\|all>` | 删除 |
 | `/remind <时间> <内容>` | 设置提醒 |
