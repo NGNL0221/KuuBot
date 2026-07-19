@@ -1,0 +1,6 @@
+{
+    "qq_app_id": "你的QQ Bot AppID",
+    "qq_app_secret": "你的QQ Bot AppSecret",
+    "deepseek_api_key": "sk-你的DeepSeek API Key",
+    "admin_openid": "你的QQ OpenID（启动后发一条消息获取）"
+}
