@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+sessions/
+config.json
+persona.txt
+*.lnk
+.DS_Store
+*.log
