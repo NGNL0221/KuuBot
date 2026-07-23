@@ -1,4 +1,4 @@
-import os, json, time, signal, re, uuid, datetime, random
+import os, json, time, signal, re, uuid, datetime, random, threading
 from . import session, cron
 from .agent import Agent
 from .qq_bot import QQBot
@@ -113,6 +113,8 @@ def main():
             bot.send_message(openid, "此 Bot 为私人使用，暂不接受陌生人消息")
             return
 
+        session.set_last_user_msg(time.time())
+
         # Sleep keyword detection
         sleep_words = ["晚安", "睡了", "困了", "休息", "去睡", "睡觉", "安", "好梦"]
         if any(w in text for w in sleep_words):
@@ -141,6 +143,9 @@ def main():
                     "/reminders — 查看提醒\n"
                     "/cancel <编号|ID|all> — 取消提醒\n"
                     "/sticker <标签> — 发送表情包\n"
+                    "/todo [内容] — 查看/添加待办\n"
+                    "/todocheck <编号> — 划掉待办\n"
+                    "/todoremove <编号|1,2,3> — 删除待办\n"
                     "/debug — 切换调试模式（去除消息发送间隔）", msg_id)
                 return
             if cmd == "/new":
@@ -167,6 +172,46 @@ def main():
                 cur = session.get_debug(openid)
                 session.set_debug(openid, not cur)
                 bot.send_message(openid, f"调试模式 {'关闭' if cur else '开启'}（消息不再有发送间隔）", msg_id)
+                return
+            elif cmd == "/todo":
+                from . import todo
+                if not arg:
+                    bot.send_message(openid, todo.get_model().format_list())
+                else:
+                    todo.get_model().add(arg)
+                    bot.send_message(openid, f"已添加「{arg}」\n{todo.get_model().format_list()}")
+                return
+            elif cmd == "/todocheck":
+                from . import todo
+                try:
+                    idx = int(arg.strip()) - 1
+                    items = todo.get_model().get_all()
+                    if idx < 0 or idx >= len(items):
+                        bot.send_message(openid, "编号超出范围")
+                    else:
+                        todo.get_model().toggle(idx)
+                        bot.send_message(openid, f"已划掉「{items[idx]['text']}」\n{todo.get_model().format_list()}")
+                except ValueError:
+                    bot.send_message(openid, "格式: /todocheck <编号>")
+                return
+            elif cmd == "/todoremove":
+                from . import todo
+                arg = arg.strip()
+                try:
+                    indices = sorted([int(x.strip()) - 1 for x in arg.split(",")], reverse=True)
+                    model = todo.get_model()
+                    removed = []
+                    for idx in indices:
+                        items = model.get_all()
+                        if 0 <= idx < len(items):
+                            removed.append(items[idx]["text"])
+                            model.remove(idx)
+                    if removed:
+                        bot.send_message(openid, "已删除: " + ", ".join(f"「{r}」" for r in removed) + "\n" + model.format_list())
+                    else:
+                        bot.send_message(openid, "没有有效的编号")
+                except ValueError:
+                    bot.send_message(openid, "格式: /todoremove <编号> 或 /todoremove 1,2,3")
                 return
             elif cmd == "/switch":
                 if not arg:
@@ -307,21 +352,127 @@ def main():
             result = agent.chat(current, openid, session_name)
             reply = result.get("reply", "(小空说不出话...)")
             sticker_paths = result.get("stickers", [])
+            has_real_tool = result.get("has_real_tool", False)
         except Exception as e:
             reply = f"(出错了: {e})"
             sticker_paths = []
+            has_real_tool = False
+
+        now_dt = datetime.datetime.now()
+        wrong_years = [str(now_dt.year - 1), str(now_dt.year - 2)]
+        if any(f"{y}年" in reply for y in wrong_years):
+            correction = agent.ask(
+                f"你的回复里年份错了。当前真实时间是 {now_dt.strftime('%Y年%m月%d日 %H:%M')}，不是你说的时间。请用真实时间修正你的回复，直接输出修正后的完整回复。\n\n原始回复: {reply[:600]}")
+            if correction:
+                reply = correction
+
+        buzzwords = {"搜到", "找到", "改好", "已修改", "已创建", "已删除",
+                     "写好了", "已写入", "执行了", "运行了", "已完成",
+                     "查到了", "读取了", "已复制", "解压了", "压缩了", "下载了"}
+        if any(w in reply for w in buzzwords) and not has_real_tool:
+            correction = agent.ask(
+                f"你刚才回复说你对主人的文件做了操作（包含以下关键词之一），但实际没有调用任何工具。请诚实回答你现在需要做什么来弥补——是调用工具补上操作，还是直接道歉说刚才没有真的执行？只输出你要发给主人的话。\n\n你的回复: {reply[:500]}")
+            if correction:
+                reply = correction
         session.append(openid, session_name, "assistant", reply)
         if session.get_mode(openid) == "casual":
-            reply = re.sub(r'\*[^*]+\*', '', reply).strip()
-            reply = re.sub(r'\n\s*\n', '\n', reply)
-            sentences = re.split(r'[。！\n]+', reply)
-            sentences = [s.strip() for s in sentences if s.strip()][:random.randint(1, 5)]
-            for sent in sentences:
-                bot.send_message(openid, sent)
-                if not session.get_debug(openid):
-                    time.sleep(random.uniform(2, 10))
+            def _casual_send(raw_reply, user_text, sess_name):
+                try:
+                    prompt = f"做两件事:\n1. 把下面的回复按语义拆成独立句子，一行一句，去掉*动作*标记\n2. 如果有值得记住的事实，用 MEM 行列出。不需要判断质量，全列出来。\n\n回复内容:\n{raw_reply[:800]}\n\n对话上文:\n主人: {user_text[:200]}\n\n输出格式（先分行输出句子，再在任何位置输出 MEM）:\n句子1\n句子2\nMEM: 主人喜欢冰美式 | 偏好,饮食\n句子3"
+                    raw = agent.ask(prompt)
+                    if not raw:
+                        bot.send_message(openid, "（小空在想）")
+                        return
+                    from . import memory
+                    mems = []
+                    for line in raw.strip().split("\n"):
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if stripped.upper().startswith("MEM:"):
+                            mem_text = stripped[4:].strip()
+                            parts = mem_text.split("|", 1)
+                            content = parts[0].strip()
+                            tags = parts[1].strip() if len(parts) > 1 else ""
+                            if content:
+                                mems.append((content, tags))
+                        else:
+                            bot.send_message(openid, stripped)
+                            if not session.get_debug(openid):
+                                time.sleep(random.uniform(2, 6))
+                    if mems:
+                        deduped = []
+                        for c, t in mems:
+                            is_dup = False
+                            for dc, _ in deduped:
+                                if len(set(c) & set(dc)) / max(len(set(c)), 1) > 0.7:
+                                    is_dup = True
+                                    break
+                            if not is_dup:
+                                deduped.append((c, t))
+                        vp = "请严格判断以下每条是否值得记入永久记忆库。对每条输出 YES 或 NO，一行一条。\n\n"
+                        vp += "✅ YES（长期偏好/反复习惯/重要计划/稳定个人信息）:\n"
+                        vp += "  主人每天早上喝冰美式 → YES\n  主人计划下个月去日本 → YES\n  主人习惯12点左右睡觉 → YES\n  主人在河南大学读测控 → YES\n  主人喜欢被小空管着 → YES\n\n"
+                        vp += "❌ NO（一次性动作/推测/测试/临时/角色反了/称呼）:\n"
+                        vp += "  主人说叫我小空 → NO\n  主人刚刚让我改代码 → NO\n  主人今晚12点睡 → NO\n  主人赶小空去睡觉 → NO（反了，是小空催主人）\n  主人让我搜文件 → NO\n\n"
+                        vp += "⚠️ 角色: 用户=主人，小空=AI猫娘女仆\n\n事实:\n"
+                        for i, (c, _) in enumerate(deduped, 1):
+                            vp += f"{i}. {c}\n"
+                        vresult = agent.ask(vp)
+                        if vresult:
+                            vlines = [l.strip().upper() for l in vresult.strip().split("\n")]
+                            for i, (c, t) in enumerate(deduped):
+                                if i < len(vlines) and vlines[i] == "YES":
+                                    memory.remember(c, t, sess_name)
+                except:
+                    pass
+            threading.Thread(target=_casual_send, args=(reply, text, session_name), daemon=True).start()
         else:
             bot.send_message(openid, reply, msg_id)
+
+            def _scribe_normal(user_text, bot_reply, sess_name):
+                try:
+                    prompt = f"扫描这段对话。如果有值得记住的事实，用 MEM 行列出。不需要判断质量，全列出来。没有就回复 NONE。\n格式: MEM: 事实内容 | 标签1,标签2\n\n主人: {user_text[:300]}\n小空: {bot_reply[:300]}"
+                    result = agent.ask(prompt)
+                    if result and result.strip().upper() != "NONE":
+                        from . import memory
+                        mems = []
+                        for line in result.strip().split("\n"):
+                            stripped = line.strip()
+                            if stripped.upper().startswith("MEM:"):
+                                mem_text = stripped[4:].strip()
+                                parts = mem_text.split("|", 1)
+                                content = parts[0].strip()
+                                tags = parts[1].strip() if len(parts) > 1 else ""
+                                if content:
+                                    mems.append((content, tags))
+                        if mems:
+                            deduped = []
+                            for c, t in mems:
+                                is_dup = False
+                                for dc, _ in deduped:
+                                    if len(set(c) & set(dc)) / max(len(set(c)), 1) > 0.7:
+                                        is_dup = True
+                                        break
+                                if not is_dup:
+                                    deduped.append((c, t))
+                            vp = "请严格判断以下每条是否值得记入永久记忆库。对每条输出 YES 或 NO，一行一条。\n\n"
+                            vp += "✅ YES（长期偏好/反复习惯/重要计划/稳定个人信息）:\n"
+                            vp += "  主人每天早上喝冰美式 → YES\n  主人计划下个月去日本 → YES\n  主人习惯12点左右睡觉 → YES\n  主人在河南大学读测控 → YES\n  主人喜欢被小空管着 → YES\n\n"
+                            vp += "❌ NO（一次性动作/推测/测试/临时/角色反了/称呼）:\n"
+                            vp += "  主人说叫我小空 → NO\n  主人刚刚让我改代码 → NO\n  主人今晚12点睡 → NO\n  主人赶小空去睡觉 → NO（反了，是小空催主人）\n  主人让我搜文件 → NO\n\n"
+                            vp += "⚠️ 角色: 用户=主人，小空=AI猫娘女仆\n\n事实:\n"
+                            for i, (c, _) in enumerate(deduped, 1):
+                                vp += f"{i}. {c}\n"
+                            vresult = agent.ask(vp)
+                            if vresult:
+                                vlines = [l.strip().upper() for l in vresult.strip().split("\n")]
+                                for i, (c, t) in enumerate(deduped):
+                                    if i < len(vlines) and vlines[i] == "YES":
+                                        memory.remember(c, t, sess_name)
+                except:
+                    pass
+            threading.Thread(target=_scribe_normal, args=(text, reply, session_name), daemon=True).start()
         if not sticker_paths:
             fallback = stickers.match_from_text(reply)
             if fallback:
@@ -332,6 +483,8 @@ def main():
                     bot.send_image(openid, sp)
                 except:
                     pass
+
+
 
     bot = QQBot(cfg["qq_app_id"], cfg["qq_app_secret"], handle_message)
     print(f"[KuuBot] Starting QQ Bot {cfg['qq_app_id']}")

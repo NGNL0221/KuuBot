@@ -185,3 +185,16 @@ def set_summary(openid: str, session_name: str, summary: str):
     path = _file_path(openid, session_name) + ".summary"
     with open(path, "w", encoding="utf-8") as f:
         f.write(summary)
+
+
+def get_last_user_msg() -> float:
+    try:
+        with open(os.path.join(DATA_DIR, "last_user_msg.txt"), "r") as f:
+            return float(f.read().strip())
+    except Exception:
+        return 0
+
+
+def set_last_user_msg(ts: float):
+    with open(os.path.join(DATA_DIR, "last_user_msg.txt"), "w") as f:
+        f.write(str(ts))

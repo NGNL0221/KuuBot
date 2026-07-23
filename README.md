@@ -7,16 +7,20 @@
 | 类别 | 能力 |
 |------|------|
 | 💬 聊天 | DeepSeek 驱动的 AI 对话，支持 Function Calling |
-| 📁 文件操作 | 读写、编辑、创建、删除、复制、压缩、解压 |
+| 📁 文件操作 | 读写、编辑、创建、删除、复制、压缩、解压（17 种工具） |
 | 🔍 本地搜索 | 文件名搜索（glob）、文件内容搜索（grep） |
 | 🌐 联网搜索 | Tavily API 驱动，模型主动调 `search` 函数查最新信息 |
+| 🧠 永久记忆 | 五表 SQLite + ChromaDB 向量语义检索 + LLM 深度归并实体画像 |
+| ✍️ Scribe 后处理 | 每条回复后 LLM 扫描 → 提取偏好/决定/计划 → 双层验证 → 自动入库 |
+| 🛡️ 后验证 | 检测模型嘴炮操作（没调工具却说"搜到了"）→ LLM 拦截纠正 |
 | 😺 表情包 | 20 张猫猫表情包，模型自动根据情绪选图发送 |
+| 📝 待办事项 | 增/查/划/删 + 模型主动记录 + 批量操作 |
 | 📄 文档 | 创建 Word 文档、全屏截图 |
 | ⏰ 自动提醒 | `/remind` 定时提醒、每日早安/晚安 |
 | 💤 休眠提醒 | 深夜自动提醒该睡觉了，说"晚安"自动闭嘴，说"早安"恢复 |
-| 💡 随机搭话 | 白天每 30-60 分钟主动搭话（含时间场景感知） |
+| 💡 随机搭话 | 用户沉默后 30-60 分钟触发，读取对话上下文 + 待办续题 |
 | 🗨️ 多会话 | `/new` `/switch` `/rename` `/delete` 会话管理 |
-| 🎮 闲聊模式 | `/casual` 真人聊天——短句、分条发、模拟打字间隔 |
+| 🎮 闲聊模式 | `/casual` LLM 语义拆句逐条发送，模拟真人聊天 |
 | 🐛 调试模式 | `/debug` 去除消息发送间隔 |
 
 ## 🚀 快速开始
@@ -24,7 +28,7 @@
 ### 1. 准备环境
 
 ```bash
-pip install websocket-client requests python-docx Pillow
+pip install websocket-client requests python-docx Pillow chromadb
 ```
 
 ### 2. 创建 QQ Bot
@@ -90,7 +94,7 @@ python KuuBot.pyw
 | 命令 | 效果 |
 |------|------|
 | `/help` | 显示指令列表 |
-| `/casual` | 真人闲聊模式 |
+| `/casual` | 真人闲聊模式（LLM 语义拆句发送） |
 | `/formal` | 恢复正常模式 |
 | `/new` | 创建新会话 |
 | `/list` | 列出所有会话 |
@@ -98,14 +102,53 @@ python KuuBot.pyw
 | `/rename <新名称>` | 重命名 |
 | `/delete <编号\|名称\|all>` | 删除 |
 | `/sticker <标签>` | 发送表情包 |
+| `/todo [内容]` | 查看/添加待办 |
+| `/todocheck <编号>` | 划掉待办 |
+| `/todoremove <编号\|1,2,3>` | 批量删除待办 |
 | `/debug` | 切换调试模式（去除消息间隔） |
 | `/remind <时间> <内容>` | 设置提醒 |
 | `/reminders` | 查看提醒 |
 | `/cancel <编号\|all>` | 取消提醒 |
 
-## 🎨 表情包标签
+## 🧠 记忆系统
 
-模型会根据对话情绪自动调用以下标签发送表情包：
+### 架构
+
+```
+聊天中 ──→ Scribe 后处理（LLM 扫描 + 双层验证）
+                ↓
+          fragments（碎片 + FTS5 + ChromaDB 向量）
+                ↓
+          深度整理（主人沉默 ≥1h，LLM 归并）
+                ↓
+          episodes（叙事摘要）+ entity_profiles（实体画像）
+                ↓
+          每次聊天注入相关记忆
+```
+
+### 记忆生命周期
+
+| 状态 | 条件 | 效果 |
+|------|------|------|
+| active | 14 天内有访问 | 正常使用 |
+| cooling | 14 天无访问 | 降权，访问即复活 |
+| frozen | 30 天无访问 | 向量索引删除 |
+| tombstone | 90 天无访问 | 内容清空 |
+
+### 记忆工具
+
+| 工具 | 用途 |
+|------|------|
+| `remember_fact` | 模型主动存储偏好/决定/计划 |
+| `recall_memory` | FTS5 + ChromaDB 混合检索 |
+| `recall_entity` | 查询实体画像与叙事摘要 |
+| `browse_memories` | 浏览所有记忆标签 |
+
+### 查看记忆
+
+双击 `memory_dump.py` → 控制台打印完整记忆库总览（碎片/叙事/实体/状态）。
+
+## 🎨 表情包标签
 
 | 标签 | 场景 |
 |------|------|
@@ -138,14 +181,17 @@ python KuuBot.pyw
 ```
 KuuBot/
 ├── KuuBot.pyw              ← 启动入口
+├── memory_dump.py          ← 记忆库查看工具
 ├── config.example.json     ← 配置模板
 ├── kuu_bot/
-│   ├── __main__.py         ← 主路由 / 命令 / cron 调度
-│   ├── agent.py            ← DeepSeek API / Function Calling / Tavily 搜索
-│   ├── tools.py            ← 18 个文件 & 系统工具
+│   ├── __main__.py         ← 主路由 / 命令 / Scribe / 后验证
+│   ├── agent.py            ← DeepSeek API / Function Calling / 深度整理
+│   ├── tools.py            ← 27 个工具定义与执行
+│   ├── memory.py           ← 五表记忆引擎 + ChromaDB 向量检索
 │   ├── qq_bot.py           ← QQ WebSocket 连接
-│   ├── cron.py             ← 早安/晚安/搭话
+│   ├── cron.py             ← 早安/晚安/搭话/记忆维护
 │   ├── session.py          ← 会话存储 & 提醒
+│   ├── todo.py             ← 待办事项数据模型
 │   ├── tray.py             ← 托盘图标
 │   ├── stickers.py         ← 表情包搜索匹配
 │   ├── stickers.json       ← 表情包标签索引
@@ -164,6 +210,7 @@ KuuBot/
 | `requests` | DeepSeek API + Tavily API |
 | `python-docx` | Word 文档读写 |
 | `Pillow` | 截图 & 图片处理 |
+| `chromadb` | 本地向量语义检索（all-MiniLM-L6-v2） |
 
 ## 📄 License
 

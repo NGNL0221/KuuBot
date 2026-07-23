@@ -279,6 +279,115 @@ TOOL_DEFS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": "💾 记住关于主人的重要事实。只记主人的明确偏好、决定、计划、个人信息，不记推测和闲聊随口话。同一事实多次出现会自动升级置信度",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string", "description": "事实内容，第三人称短句，如「主人喜欢喝冰美式」「主人计划下周去日本」"},
+                    "tags": {"type": "string", "description": "逗号分隔的标签，如「偏好,饮食」或「计划,旅行」"},
+                },
+                "required": ["content", "tags"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_memory",
+            "description": "🔍 搜索关于主人的记忆。当你需要回忆主人说过的事实时使用",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "搜索关键词"},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "browse_memories",
+            "description": "📋 浏览所有记忆标签，了解你知道关于主人的哪些话题",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_entity",
+            "description": "🏷️ 查询某个实体的完整画像（概述+相关叙事摘要）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "实体名/标签名，如「饮食」「学业」「旅行」"},
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_todo",
+            "description": "📝 添加一条待办事项",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "待办内容"},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_todos",
+            "description": "📋 查看所有待办事项列表",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_todo",
+            "description": "✅ 标记待办事项为已完成（从1开始编号）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "待办编号（从1开始）"},
+                },
+                "required": ["index"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remove_todo",
+            "description": "🗑️ 删除一条待办事项（从1开始编号）",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "index": {"type": "integer", "description": "待办编号（从1开始）"},
+                },
+                "required": ["index"],
+            },
+        },
+    },
 ]
 
 
@@ -452,16 +561,26 @@ def execute(tool_name: str, args: dict) -> str:
         path = args.get("path", "")
         if not os.path.isabs(path):
             return f"delete 失败：必须是绝对路径"
+        if not os.path.exists(path):
+            return f"文件不存在: {path}"
         try:
             if os.path.isdir(path):
                 os.rmdir(path)
             else:
                 os.remove(path)
             return f"已删除: {path}"
-        except OSError as e:
-            return f"delete 失败 [{path}]: {e}（试试 bash 强制删除？）"
+        except Exception:
+            pass
+        try:
+            r = subprocess.run(
+                ["powershell", "-Command", f"Remove-Item -LiteralPath '{path}' -Force -ErrorAction Stop"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode == 0:
+                return f"已删除: {path}"
+            return f"删除失败 [{path}]: {r.stderr.strip()[:200]}"
         except Exception as e:
-            return f"delete 失败 [{path}]: {e}"
+            return f"删除失败 [{path}]: {e}"
 
     elif tool_name == "mkdir":
         path = args.get("path", "")

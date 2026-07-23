@@ -2,7 +2,6 @@ import time
 import random
 import datetime
 import threading
-import requests
 from . import session
 from . import stickers
 
@@ -104,6 +103,9 @@ def _loop():
         if 9 <= h < 22 and not _sleep_disabled:
             _random_chat(openid, today)
 
+        # ── Memory maintenance ──
+        _memory_maintenance(today)
+
         # ── Reset sleep at 4am ──
         if h == 4 and m < 5:
             _sleep_disabled = False
@@ -146,31 +148,45 @@ def _check_reminders(openid, now):
 def _random_chat(openid, today):
     if not _agent or not openid:
         return
-    state = session.get_cron_state()
-    key = f"chat_last_{today}"
-    last = state.get(key, 0)
-    interval = random.randint(1800, 3600)
-    if time.time() - last < interval:
+
+    last_user_msg = session.get_last_user_msg()
+    if last_user_msg == 0:
         return
+
+    elapsed = time.time() - last_user_msg
+    if elapsed < 1800:
+        return
+
+    state = session.get_cron_state()
+    key = f"chat_after_user"
+    last_chat = state.get(key, 0)
+    if last_chat >= last_user_msg:
+        return
+
+    if elapsed < random.randint(1800, 3600):
+        return
+
     session.set_cron_state({key: time.time()})
 
-    # 50% chance: no topic, just casual chat
-    if random.random() < 0.5:
-        topic_hint = ""
-    else:
-        topics = _fetch_topics()
-        if topics:
-            used = set(state.get("used_topics", []))
-            topic_hint = f"\n当前热门话题（优先选ACGN相关的，避开已用: {', '.join(list(used)[-3:])}）:\n{topics}"
-            # Track used topics
-            new_used = list(used)
-            for line in topics.split("\n"):
-                new_used.append(line)
-            if len(new_used) > 50:
-                new_used = new_used[-20:]
-            session.set_cron_state({"used_topics": new_used})
-        else:
-            topic_hint = ""
+    session_name = session.get_current_session(openid)
+    history = session.load(openid, session_name)[-6:]
+    ctx_str = ""
+    if history:
+        lines = []
+        for m in history:
+            role = "主人" if m["role"] == "user" else "小空"
+            lines.append(f"[{role}]: {m['content'][:200]}")
+        ctx_str = "\n\n📋 最近对话:\n" + "\n".join(lines)
+
+    try:
+        from . import todo
+        pending = todo.get_model().get_pending()
+        if pending:
+            todo_ctn = "\n".join(f"  · {t['text']}" for t in pending[:5])
+            ctx_str += f"\n\n📝 主人当前待办（未完成）:\n{todo_ctn}"
+    except:
+        pass
+
     try:
         mode = session.get_meta(openid).get("mode", "build")
         casual_note = ""
@@ -194,25 +210,24 @@ def _random_chat(openid, today):
         else:
             ctx = "深夜，主人该睡了"
         time_ctx = f"现在是{wd} {now.strftime('%H:%M')}，{ctx}。"
+        elapsed_min = int(elapsed // 60)
         result = _agent.chat([{
             "role": "user",
-            "content": casual_note + f"（系统主动搭话。{time_ctx}根据时间场景随意聊一两句，禁止直接说'今天是星期几'。可以是吐槽、卖萌、小段子）" + topic_hint
+            "content": casual_note + f"（系统主动搭话。{time_ctx}距离上次对话已过{elapsed_min}分钟。根据最近对话上下文，继续未完成话题、衍生相关话题、或开启全新话题。简短一两句，禁止直接说'星期几'或'现在是几点'）" + ctx_str
         }])
         msg = result.get("reply", "").strip()
         if msg and _send_func and _running:
             _send_func(openid, msg)
-            # 20% chance: add a matching sticker
             if random.random() < 0.2 and _send_image_func:
                 sticker = stickers.match_from_text(msg)
                 if not sticker:
                     sticker = stickers.random_sticker()
                 if sticker:
                     try:
-                        ok, _ = _send_image_func(openid, sticker)
+                        _send_image_func(openid, sticker)
                     except:
                         pass
             try:
-                session_name = session.get_current_session(openid)
                 session.append(openid, session_name, "assistant", msg)
             except:
                 pass
@@ -220,16 +235,30 @@ def _random_chat(openid, today):
         pass
 
 
-def _fetch_topics():
+def _memory_maintenance(today: str):
+    state = session.get_cron_state()
+    key = f"mem_maint_{today}"
+    last = state.get(key, 0)
+    if time.time() - last < 300:
+        return
+    session.set_cron_state({key: time.time()})
     try:
-        h = {"User-Agent": "Mozilla/5.0"}
-        resp = requests.get("https://api.bilibili.com/x/web-interface/popular?ps=10", headers=h, timeout=10)
-        data = resp.json()
-        lines = []
-        for item in data.get("data", {}).get("list", [])[:10]:
-            title = item.get("title", "")
-            tag = item.get("tname", "")
-            lines.append(f"[{tag}] {title}")
-        return "\n".join(lines)
+        from . import memory
+        memory.run_lifecycle()
     except:
-        return ""
+        pass
+
+    if _agent:
+        last_user = session.get_last_user_msg()
+        if last_user > 0 and time.time() - last_user >= 3600:
+            deep_key = f"mem_deep"
+            last_deep = state.get(deep_key, 0)
+            if time.time() - last_deep >= 7200:
+                try:
+                    from . import memory
+                    frags = memory.get_unconsolidated_fragments()
+                    if len(frags) >= 2:
+                        _agent._deep_consolidate()
+                        session.set_cron_state({deep_key: time.time()})
+                except:
+                    pass

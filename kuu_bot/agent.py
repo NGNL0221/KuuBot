@@ -10,7 +10,6 @@ MAX_TOOL_ROUNDS = 15
 
 ENV_CTX = """
 当前环境: Windows 10/11, Python 3.10
-默认工作目录: D:/妙妙工具/KuuBot/
 当前时间: {NOW} ← 这是真实时间，回答时间相关问题时必须用这个，绝对禁止编造时间。
 
 常用路径:
@@ -128,6 +127,81 @@ class Agent:
         except Exception as e:
             return f"搜索失败: {e}"
 
+    def _deep_consolidate(self):
+        """深度整理：合并碎片→Episode + 更新实体画像。LLM 调用，在用户空闲时由 cron 触发"""
+        from . import memory
+        fragments = memory.get_unconsolidated_fragments()
+        if len(fragments) < 2:
+            return
+
+        groups = memory.group_fragments_by_tags(fragments)
+        for tag, frags in groups.items():
+            if len(frags) < 2:
+                continue
+            entity = memory.get_or_create_entity(tag)
+            for f in frags:
+                memory.link_fragment_to_entity(f["id"], tag)
+
+            summary_lines = "\n".join(f"· {f['content']}" for f in frags[:10])
+            try:
+                resp = requests.post(
+                    DEEPSEEK_URL,
+                    headers={
+                        "Authorization": f"Bearer {self._key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{
+                            "role": "user",
+                            "content": f"请将以下关于同一话题的零散记忆合并成一段简洁的叙事摘要（80字以内，第三人称），只输出摘要:\n\n{summary_lines}"
+                        }],
+                        "temperature": 0.3,
+                        "max_tokens": 300,
+                    },
+                    timeout=30,
+                )
+                data = resp.json()
+                episode_text = data["choices"][0]["message"]["content"].strip()
+                if episode_text:
+                    fid_list = [f["id"] for f in frags]
+                    emotional = 0.5
+                    memory.save_episode(tag, episode_text, fid_list, tag, emotional)
+                    memory.mark_consolidated(fid_list)
+            except Exception:
+                pass
+
+        for tag in groups:
+            entity = memory.get_entity(tag)
+            if not entity or entity["episode_count"] < 1:
+                continue
+            episodes = memory.get_entity_episodes(tag, 3)
+            ep_text = "\n".join(f"· {e['content']}" for e in episodes)
+            try:
+                resp = requests.post(
+                    DEEPSEEK_URL,
+                    headers={
+                        "Authorization": f"Bearer {self._key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={
+                        "model": "deepseek-chat",
+                        "messages": [{
+                            "role": "user",
+                            "content": f"请根据以下叙事摘要，生成一句简洁的实体概述（50字以内，第三人称），只输出概述:\n\n{ep_text}"
+                        }],
+                        "temperature": 0.3,
+                        "max_tokens": 200,
+                    },
+                    timeout=30,
+                )
+                data = resp.json()
+                overview = data["choices"][0]["message"]["content"].strip()
+                if overview:
+                    memory.update_entity_overview(tag, overview)
+            except Exception:
+                pass
+
     def chat(self, messages: list, openid: str = "", session_name: str = "default") -> dict:
         from . import session as sess
         # Check if summarization is needed (every ~15 user messages)
@@ -155,7 +229,28 @@ class Agent:
         sys_content = self._persona + "\n\n" + ENV_CTX.replace("{NOW}", now_str)
         if summary:
             sys_content += f"\n\n📋 对话历史摘要:\n{summary}"
-        sys_content += casual_note + "\n" + tools.TOOLS_DESC + "\n\n🚨 每次回复主人时，必须调用 sticker 函数发一个表情包。根据回复情绪从以下选一个最匹配的: 震惊佩服 普通困惑 无语鄙夷 点赞赞同 震惊变态 不服挑衅 傻子挑衅 失落 调戏挑衅 忍怒生气 不赖赞同 啊困惑 闷气诅咒 害羞挡脸 贱笑拍照 贱笑 中指鄙视 可爱困惑 轻松开心。每次尽量选不一样的，别连续用同一个！"
+
+        try:
+            from . import memory
+            recent_text = " ".join(
+                m["content"][:100] for m in messages[-3:]
+                if m.get("role") == "user"
+            )
+            if recent_text:
+                mems = memory.recall_for_context(recent_text, 5)
+                if mems:
+                    lines = []
+                    for m in mems:
+                        if m.get("type") == "fragment":
+                            mark = "✓" if m.get("confidence", 1) >= 3 else "?"
+                            lines.append(f"· {mark} {m['content']}")
+                        else:
+                            lines.append(f"· 【{m['entity']}】{m['content']}")
+                    sys_content += f"\n\n💾 永久记忆:\n" + "\n".join(lines)
+        except:
+            pass
+
+        sys_content += casual_note + "\n" + tools.TOOLS_DESC + "\n\n🚨 每次回复主人时，必须调用 sticker 函数发一个表情包。根据回复情绪从以下选一个最匹配的: 震惊佩服 普通困惑 无语鄙夷 点赞赞同 震惊变态 不服挑衅 傻子挑衅 失落 调戏挑衅 忍怒生气 不赖赞同 啊困惑 闷气诅咒 害羞挡脸 贱笑拍照 贱笑 中指鄙视 可爱困惑 轻松开心。每次尽量选不一样的，别连续用同一个！\n\n📝 主人提到要做什么事时，必须调用 add_todo 记录待办。主人问待办时用 list_todos 查看。\n\n💾 主人说了明确的偏好、决定、计划、个人信息时，必须调用 remember_fact 存起来。不推测不记闲聊。需要回忆时用 recall_memory 搜索。"
         full_msgs = [{"role": "system", "content": sys_content}]
 
         # Take last 100 messages, trim summary from user-facing msgs
@@ -164,6 +259,7 @@ class Agent:
 
         sticker_paths = []
         non_sticker_rounds = 0
+        has_real_tool = False
 
         while non_sticker_rounds < MAX_TOOL_ROUNDS:
             resp = requests.post(
@@ -188,15 +284,15 @@ class Agent:
                 choice = data["choices"][0]
                 msg = choice["message"]
             except Exception as e:
-                return {"reply": f"(小空出了点问题: {e})", "stickers": sticker_paths}
+                return {"reply": f"(小空出了点问题: {e})", "stickers": sticker_paths, "has_real_tool": has_real_tool}
 
             tool_calls = msg.get("tool_calls")
             if not tool_calls:
                 reply = msg.get("content", "")
                 if reply.strip():
                     full_msgs.append({"role": "assistant", "content": reply})
-                    return {"reply": reply, "stickers": sticker_paths}
-                return {"reply": "(嗯...小空在想)", "stickers": sticker_paths}
+                    return {"reply": reply, "stickers": sticker_paths, "has_real_tool": has_real_tool}
+                return {"reply": "(嗯...小空在想)", "stickers": sticker_paths, "has_real_tool": has_real_tool}
 
             has_non_sticker = any(tc["function"]["name"] != "sticker" for tc in tool_calls)
             if has_non_sticker:
@@ -221,8 +317,77 @@ class Agent:
                         result = f"表情包 [{tag}] 未找到，但不影响回复"
                 elif name == "search":
                     result = self._web_search(args.get("query", ""))
+                elif name == "remember_fact":
+                    from . import memory
+                    content = args.get("content", "")
+                    tags = args.get("tags", "")
+                    memory.remember(content, tags, session_name)
+                    cnt = memory.count()
+                    result = f"已记住 [{cnt}]: {content}"
+                elif name == "recall_memory":
+                    from . import memory
+                    mems = memory.recall(args.get("query", ""))
+                    if mems:
+                        result = "\n".join(
+                            f"[{m['id']}] {m['content']} (tags: {m['tags']})"
+                            for m in mems
+                        )
+                    else:
+                        result = "没有找到相关记忆"
+                elif name == "browse_memories":
+                    from . import memory
+                    tags = memory.get_all_tags()
+                    cnt = memory.count()
+                    if tags:
+                        result = f"记忆标签({cnt}条): " + ", ".join(tags)
+                    else:
+                        result = "还没有存储任何记忆"
+                elif name == "recall_entity":
+                    from . import memory
+                    name = args.get("name", "")
+                    e = memory.get_entity(name)
+                    if not e:
+                        result = f"未找到实体 [{name}]，可用标签: " + ", ".join(memory.get_all_tags())
+                    else:
+                        lines = [f"【{e['name']}】碎片 {e['fragment_count']} 条 / 叙事 {e['episode_count']} 条"]
+                        if e.get("overview"):
+                            lines.append(f"  概述: {e['overview']}")
+                        eps = memory.get_entity_episodes(name, 3)
+                        if eps:
+                            lines.append("  叙事:")
+                            for ep in eps:
+                                lines.append(f"    · {ep['content']}")
+                        result = "\n".join(lines)
+                elif name == "add_todo":
+                    from . import todo
+                    text = args.get("text", "")
+                    todo.get_model().add(text)
+                    result = f"已添加「{text}」\n{todo.get_model().format_list()}"
+                elif name == "list_todos":
+                    from . import todo
+                    result = todo.get_model().format_list()
+                elif name == "check_todo":
+                    from . import todo
+                    idx = args.get("index", 0) - 1
+                    items = todo.get_model().get_all()
+                    if idx < 0 or idx >= len(items):
+                        result = f"编号 {args.get('index', 0)} 超出范围"
+                    else:
+                        todo.get_model().toggle(idx)
+                        result = f"已划掉「{items[idx]['text']}」\n{todo.get_model().format_list()}"
+                elif name == "remove_todo":
+                    from . import todo
+                    idx = args.get("index", 0) - 1
+                    items = todo.get_model().get_all()
+                    if idx < 0 or idx >= len(items):
+                        result = f"编号 {args.get('index', 0)} 超出范围"
+                    else:
+                        text = items[idx]["text"]
+                        todo.get_model().remove(idx)
+                        result = f"已删除「{text}」\n{todo.get_model().format_list()}"
                 else:
                     result = tools.execute(name, args)
+                    has_real_tool = True
 
                 full_msgs.append({
                     "role": "assistant",
@@ -235,4 +400,4 @@ class Agent:
                     "content": result,
                 })
 
-        return {"reply": "(工具调用太多次了，请换个方式问我~)", "stickers": sticker_paths}
+        return {"reply": "(工具调用太多次了，请换个方式问我~)", "stickers": sticker_paths, "has_real_tool": has_real_tool}
